@@ -60,7 +60,34 @@ using GemmRs128x256x32 = GemmRsTileConfig<ThreadblockShape128x256x32, false>;
 using DefaultGemmRsConfig = GemmRs128x128x32;
 
 template <class GemmRsConfig>
-struct GemmRsKernelTypes;
+struct GemmRsKernelTypes {
+  using ThreadblockShape = typename GemmRsConfig::ThreadblockShape;
+  using WarpShape = typename GemmRsConfig::WarpShape;
+  using ThreadblockSwizzle = typename GemmRsConfig::ThreadblockSwizzle;
+  static constexpr bool FuseReduction = GemmRsConfig::FuseReduction;
+  static constexpr int AlignmentC = GemmRsConfig::AlignmentC;
+  static constexpr int Stages = GemmRsConfig::Stages;
+
+  using OutputTileThreadMap = cutlass_utils::OutputTileThreadMap<
+      ThreadblockShape,
+      WarpShape,
+      AlignmentC>;
+
+  using StoreD = GemmRsScatterStoreEVT<OutputTileThreadMap, ThreadblockShape, FuseReduction>;
+  using ComputeD = cutlass_utils::AlphaAccumEVT<>;
+  using Epilogue = cutlass_utils::Sm80EpilogueEVT<StoreD, ComputeD>;
+
+  using Gemm = cutlass_utils::Sm80RcrGemmWithVisitor<
+      ThreadblockShape,
+      WarpShape,
+      AlignmentC,
+      Stages,
+      Epilogue,
+      ThreadblockSwizzle>;
+
+  using Device = typename Gemm::Device;
+  using Arguments = typename Gemm::Arguments;
+};
 
 // 后续实现时在这里做 host 侧薄检查：rank/world_size、scatter ptr、M/world_size、
 // tiled_m/world_size 以及当前是否要求 M 对齐 ThreadblockShape::kM。
