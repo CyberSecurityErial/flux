@@ -5,7 +5,7 @@
 
 #include <cuda_runtime_api.h>
 
-#include "sm80_gemmrs_kernel.cuh"
+#include "sm80_gemmrs.cuh"
 
 namespace {
 

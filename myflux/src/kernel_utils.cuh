@@ -93,6 +93,7 @@ constexpr int kAlignmentA = 128 / cutlass::sizeof_bits<Element>::value;
 constexpr int kAlignmentB = 128 / cutlass::sizeof_bits<Element>::value;
 constexpr int kEpilogueStages = 1;
 
+// epilogue阶段每个thread结束作业后发射出去的每块tile定义
 template <class ThreadblockShape, class WarpShape, int AlignmentC>
 using OutputTileThreadMap = cutlass::epilogue::threadblock::OutputTileThreadLayout<
     ThreadblockShape,
@@ -101,7 +102,7 @@ using OutputTileThreadMap = cutlass::epilogue::threadblock::OutputTileThreadLayo
     AlignmentC,
     kEpilogueStages>;
 
-// D = alpha * accumulator. 先不处理 bias/beta，这样临时 case 只验证 CUTLASS 组装。
+// EVT是epi阶段的数据流定义方式。根据模版参数是第几个决定这个节点在树里面的位置，是根还是叶子，还是内部。                 
 template <class ElementD = Element>
 using AlphaAccumEVT = cutlass::epilogue::threadblock::Sm80EVT<
     cutlass::epilogue::threadblock::VisitorCompute<
@@ -112,6 +113,7 @@ using AlphaAccumEVT = cutlass::epilogue::threadblock::Sm80EVT<
     cutlass::epilogue::threadblock::VisitorScalarBroadcast<ElementAccumulator>,
     cutlass::epilogue::threadblock::VisitorAccFetch>;
 
+// 消费EVT产生的结果，写到每个thread的tile
 template <class OutputTileThreadMap_, int AlignmentC>
 using PlainStoreEVT = cutlass::epilogue::threadblock::VisitorAuxStore<
     OutputTileThreadMap_,
