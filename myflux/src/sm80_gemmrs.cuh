@@ -1,6 +1,8 @@
 #pragma once
 
 #include "kernel_utils.cuh"
+#include "sm80_gemmrs_epilogue.cuh"
+#include "sm80_gemmrs_swizzle.cuh"
 
 namespace myflux::sm80_gemmrs {
 
@@ -13,6 +15,67 @@ using WarpShape64x64x32 = cutlass::gemm::GemmShape<64, 64, 32>;
 
 constexpr int kPlainGemmAlignmentC = 128 / cutlass::sizeof_bits<cutlass_utils::Element>::value;
 constexpr int kPlainGemmStages = 3;
+constexpr int kGemmRsStages = 3;
+
+enum class GemmRsTileKind {
+  k128x128x32,
+  k128x128x64,
+  k128x256x32,
+};
+
+struct GemmRsProblem {
+  int m = 0;
+  int n = 0;
+  int k = 0;
+};
+
+struct GemmRsLaunchParams {
+  GemmRsProblem problem = {};
+  const cutlass_utils::Element *ptr_a = nullptr;
+  const cutlass_utils::Element *ptr_b = nullptr;
+  cutlass_utils::Element **output_scatter_ptrs = nullptr;
+  int rank = 0;
+  int world_size = 1;
+  float alpha = 1.0f;
+  int avail_sms = -1;
+};
+
+template <
+    class ThreadblockShape_,
+    bool FuseReduction_,
+    int Stages_ = kGemmRsStages>
+struct GemmRsTileConfig {
+  using ThreadblockShape = ThreadblockShape_;
+  using WarpShape = WarpShape64x64x32;
+  using ThreadblockSwizzle = DefaultGemmRsThreadblockSwizzle;
+  static constexpr bool FuseReduction = FuseReduction_;
+  static constexpr int Stages = Stages_;
+  static constexpr int AlignmentC =
+      (FuseReduction ? 32 : 128) / cutlass::sizeof_bits<cutlass_utils::Element>::value;
+};
+
+using GemmRs128x128x32 = GemmRsTileConfig<ThreadblockShape128x128x32, false>;
+using GemmRs128x128x64 = GemmRsTileConfig<ThreadblockShape128x128x64, false>;
+using GemmRs128x256x32 = GemmRsTileConfig<ThreadblockShape128x256x32, false>;
+using DefaultGemmRsConfig = GemmRs128x128x32;
+
+template <class GemmRsConfig>
+struct GemmRsKernelTypes;
+
+template <class GemmRsConfig>
+typename GemmRsKernelTypes<GemmRsConfig>::Arguments
+make_gemmrs_args(const GemmRsLaunchParams &params);
+
+template <class GemmRsConfig>
+size_t
+gemmrs_workspace_size(const typename GemmRsKernelTypes<GemmRsConfig>::Arguments &args);
+
+template <class GemmRsConfig>
+void
+run_gemmrs(
+    const typename GemmRsKernelTypes<GemmRsConfig>::Arguments &args,
+    void *workspace,
+    cudaStream_t stream);
 
 using PlainComputeD = cutlass_utils::AlphaAccumEVT<>;
 
