@@ -1,9 +1,12 @@
+#include "sm80_gemmrs.cuh"
+
+#ifdef MYFLUX_CHECK_CUDA
+#undef MYFLUX_CHECK_CUDA
+#endif
+
 #include "performance_utils.h"
 
-#include <cublas_v2.h>
-#include <cuda_fp16.h>
 #include <cuda_runtime_api.h>
-#include <nccl.h>
 
 #include <condition_variable>
 #include <cstdint>
@@ -20,51 +23,10 @@
 
 namespace {
 
+using Element = myflux::cutlass_utils::Element;
+using FusedGemmRsConfig = myflux::sm80_gemmrs::
+    GemmRsTileConfig<myflux::sm80_gemmrs::ThreadblockShape128x128x32, true>;
 using myflux::perf::CudaEventTimer;
-
-void
-check_cublas(cublasStatus_t status, const char *expr, const char *file, int line) {
-  if (status != CUBLAS_STATUS_SUCCESS) {
-    std::cerr << "cuBLAS error at " << file << ":" << line << ": " << expr
-              << " failed with status " << static_cast<int>(status) << "\n";
-    std::abort();
-  }
-}
-
-void
-check_nccl(ncclResult_t status, const char *expr, const char *file, int line) {
-  if (status != ncclSuccess) {
-    std::cerr << "NCCL error at " << file << ":" << line << ": " << expr
-              << " failed: " << ncclGetErrorString(status) << "\n";
-    std::abort();
-  }
-}
-
-#define MYFLUX_CHECK_CUBLAS(expr) check_cublas((expr), #expr, __FILE__, __LINE__)
-#define MYFLUX_CHECK_NCCL(expr) check_nccl((expr), #expr, __FILE__, __LINE__)
-
-struct MyfluxSm80GemmRsLaunchParams {
-  int m = 0;
-  int n = 0;
-  int k = 0;
-  int rank = 0;
-  int world_size = 1;
-  const void *input = nullptr;
-  const void *weight = nullptr;
-  void **output_scatter_ptrs = nullptr;
-  void *workspace = nullptr;
-  size_t workspace_bytes = 0;
-};
-
-extern "C" size_t myflux_sm80_gemmrs_get_workspace_size(
-    int m,
-    int n,
-    int k,
-    int world_size) __attribute__((weak));
-
-extern "C" int myflux_sm80_gemmrs_launch(
-    const MyfluxSm80GemmRsLaunchParams *params,
-    cudaStream_t stream) __attribute__((weak));
 
 class ThreadBarrier {
  public:
@@ -98,9 +60,16 @@ struct Options {
   int warmup = 10;
   int iters = 50;
   int device_start = 0;
-  bool run_baseline = true;
-  bool run_fused = true;
+  int avail_sms = -1;
   bool clear_fused_output = true;
+};
+
+struct RankBuffers {
+  Element *input = nullptr;         // 本 rank 的 GEMM 输入 A，形状 [M, K]
+  Element *weight = nullptr;        // 本 rank 的 GEMM 权重 W，形状 [N, K]
+  Element *fused_output = nullptr;  // 完整 [M, N] buffer，前 [M/world_size, N] 是本 rank 结果
+  void *workspace = nullptr;        // CUTLASS fused GEMMRS workspace
+  size_t workspace_bytes = 0;       // fused workspace 字节数
 };
 
 bool
@@ -127,15 +96,15 @@ parse_int_arg(int argc, char **argv, int &i, const std::string &arg, const char 
 void
 print_usage(const char *program) {
   std::cout << "Usage: " << program << " [options]\n"
-            << "  --m <int>                 GEMM M, must be divisible by world size\n"
-            << "  --n <int>                 GEMM N\n"
-            << "  --k <int>                 local GEMM K per rank\n"
-            << "  --world-size <int>        number of local GPUs, default 8\n"
-            << "  --device-start <int>      first CUDA device ordinal, default 0\n"
-            << "  --warmup <int>            warmup iterations, default 10\n"
-            << "  --iters <int>             timed iterations, default 50\n"
-            << "  --mode baseline|fused|both\n"
-            << "  --no-fused-clear          do not clear fused output before launch\n";
+            << "  --m <int>             GEMM M, must be divisible by world size\n"
+            << "  --n <int>             GEMM N\n"
+            << "  --k <int>             local GEMM K per rank\n"
+            << "  --world-size <int>    local GPU count, default 8\n"
+            << "  --device-start <int>  first CUDA device ordinal, default 0\n"
+            << "  --warmup <int>        warmup iterations, default 10\n"
+            << "  --iters <int>         timed iterations, default 50\n"
+            << "  --avail-sms <int>     CUTLASS avail_sms, default -1\n"
+            << "  --no-fused-clear      skip per-iteration output clear for raw kernel timing\n";
 }
 
 Options
@@ -160,23 +129,8 @@ parse_options(int argc, char **argv) {
       opt.warmup = parse_int_arg(argc, argv, i, arg, "--warmup");
     } else if (arg == "--iters" || starts_with(arg, "--iters=")) {
       opt.iters = parse_int_arg(argc, argv, i, arg, "--iters");
-    } else if (arg == "--mode") {
-      if (i + 1 >= argc) {
-        throw std::invalid_argument("missing value for --mode");
-      }
-      std::string mode(argv[++i]);
-      opt.run_baseline = mode == "baseline" || mode == "both";
-      opt.run_fused = mode == "fused" || mode == "both";
-      if (!opt.run_baseline && !opt.run_fused) {
-        throw std::invalid_argument("unsupported --mode: " + mode);
-      }
-    } else if (starts_with(arg, "--mode=")) {
-      std::string mode = arg.substr(std::strlen("--mode="));
-      opt.run_baseline = mode == "baseline" || mode == "both";
-      opt.run_fused = mode == "fused" || mode == "both";
-      if (!opt.run_baseline && !opt.run_fused) {
-        throw std::invalid_argument("unsupported --mode: " + mode);
-      }
+    } else if (arg == "--avail-sms" || starts_with(arg, "--avail-sms=")) {
+      opt.avail_sms = parse_int_arg(argc, argv, i, arg, "--avail-sms");
     } else if (arg == "--no-fused-clear") {
       opt.clear_fused_output = false;
     } else {
@@ -184,31 +138,21 @@ parse_options(int argc, char **argv) {
     }
   }
 
-  if (opt.world_size <= 0 || opt.world_size > 16) {
-    throw std::invalid_argument("world size must be in (0, 16]");
-  }
-  if (opt.m % opt.world_size != 0) {
-    throw std::invalid_argument("m must be divisible by world size");
+  if (opt.world_size <= 0 || opt.world_size > myflux::kMaxWorldSize) {
+    throw std::invalid_argument("world size must be in (0, kMaxWorldSize]");
   }
   if (opt.m <= 0 || opt.n <= 0 || opt.k <= 0 || opt.iters <= 0 || opt.warmup < 0) {
     throw std::invalid_argument("m/n/k/iters must be positive and warmup must be non-negative");
   }
+  if (opt.m % opt.world_size != 0) {
+    throw std::invalid_argument("m must be divisible by world size");
+  }
   return opt;
 }
 
-struct RankBuffers {
-  void *input = nullptr;             // 本 rank 的 GEMM 输入 A，形状 [M, K]
-  void *weight = nullptr;            // 本 rank 的 GEMM 权重 W，形状 [N, K]
-  void *full_output = nullptr;       // baseline GEMM 完整输出，形状 [M, N]
-  void *baseline_output = nullptr;   // NCCL reduce-scatter 后属于本 rank 的输出 shard
-  void *fused_output = nullptr;      // fused GEMM+RS 写入的本 rank 输出 shard
-  void *fused_workspace = nullptr;   // fused kernel 需要的额外 workspace
-  size_t fused_workspace_bytes = 0;  // fused workspace 字节数
-};
-
 size_t
 bytes_for_half(int64_t elements) {
-  return static_cast<size_t>(elements) * sizeof(__half);
+  return static_cast<size_t>(elements) * sizeof(Element);
 }
 
 void
@@ -236,164 +180,142 @@ enable_peer_access(const Options &opt) {
   }
 }
 
+myflux::sm80_gemmrs::GemmRsLaunchParams
+make_fused_params(
+    const Options &opt,
+    int rank,
+    const RankBuffers &buf,
+    Element **fused_output_ptrs) {
+  myflux::sm80_gemmrs::GemmRsLaunchParams params;
+  params.problem = {opt.m, opt.n, opt.k};
+  params.ptr_a = buf.input;
+  params.ptr_b = buf.weight;
+  params.output_scatter_ptrs = fused_output_ptrs;
+  params.rank = rank;
+  params.world_size = opt.world_size;
+  params.alpha = 1.0f;
+  params.avail_sms = opt.avail_sms;
+  return params;
+}
+
 std::vector<RankBuffers>
 allocate_buffers(const Options &opt) {
   std::vector<RankBuffers> buffers(opt.world_size);
-  int m_per_rank = opt.m / opt.world_size;
 
   size_t input_bytes = bytes_for_half(static_cast<int64_t>(opt.m) * opt.k);
   size_t weight_bytes = bytes_for_half(static_cast<int64_t>(opt.n) * opt.k);
-  size_t full_output_bytes = bytes_for_half(static_cast<int64_t>(opt.m) * opt.n);
-  size_t shard_output_bytes = bytes_for_half(static_cast<int64_t>(m_per_rank) * opt.n);
+  size_t fused_output_bytes = bytes_for_half(static_cast<int64_t>(opt.m) * opt.n);
 
   std::cout << "per-rank buffers: input=" << myflux::perf::format_bytes(input_bytes)
             << " weight=" << myflux::perf::format_bytes(weight_bytes)
-            << " full_output=" << myflux::perf::format_bytes(full_output_bytes)
-            << " shard_output=" << myflux::perf::format_bytes(shard_output_bytes) << "\n";
+            << " fused_output=" << myflux::perf::format_bytes(fused_output_bytes) << "\n";
 
   for (int rank = 0; rank < opt.world_size; ++rank) {
     MYFLUX_CHECK_CUDA(cudaSetDevice(opt.device_start + rank));
     auto &buf = buffers[rank];
-    MYFLUX_CHECK_CUDA(cudaMalloc(&buf.input, input_bytes));
-    MYFLUX_CHECK_CUDA(cudaMalloc(&buf.weight, weight_bytes));
-    MYFLUX_CHECK_CUDA(cudaMalloc(&buf.full_output, full_output_bytes));
-    MYFLUX_CHECK_CUDA(cudaMalloc(&buf.baseline_output, shard_output_bytes));
-    MYFLUX_CHECK_CUDA(cudaMalloc(&buf.fused_output, shard_output_bytes));
+    MYFLUX_CHECK_CUDA(cudaMalloc(reinterpret_cast<void **>(&buf.input), input_bytes));
+    MYFLUX_CHECK_CUDA(cudaMalloc(reinterpret_cast<void **>(&buf.weight), weight_bytes));
+    MYFLUX_CHECK_CUDA(cudaMalloc(reinterpret_cast<void **>(&buf.fused_output), fused_output_bytes));
 
     MYFLUX_CHECK_CUDA(cudaMemset(buf.input, 1, input_bytes));
     MYFLUX_CHECK_CUDA(cudaMemset(buf.weight, 2, weight_bytes));
-    MYFLUX_CHECK_CUDA(cudaMemset(buf.full_output, 0, full_output_bytes));
-    MYFLUX_CHECK_CUDA(cudaMemset(buf.baseline_output, 0, shard_output_bytes));
-    MYFLUX_CHECK_CUDA(cudaMemset(buf.fused_output, 0, shard_output_bytes));
-
-    if (myflux_sm80_gemmrs_get_workspace_size != nullptr) {
-      buf.fused_workspace_bytes =
-          myflux_sm80_gemmrs_get_workspace_size(opt.m, opt.n, opt.k, opt.world_size);
-      if (buf.fused_workspace_bytes != 0) {
-        MYFLUX_CHECK_CUDA(cudaMalloc(&buf.fused_workspace, buf.fused_workspace_bytes));
-        MYFLUX_CHECK_CUDA(cudaMemset(buf.fused_workspace, 0, buf.fused_workspace_bytes));
-      }
-    }
+    MYFLUX_CHECK_CUDA(cudaMemset(buf.fused_output, 0, fused_output_bytes));
   }
   return buffers;
+}
+
+void
+allocate_workspaces(
+    const Options &opt,
+    std::vector<RankBuffers> &buffers,
+    Element **fused_output_ptrs) {
+  for (int rank = 0; rank < opt.world_size; ++rank) {
+    MYFLUX_CHECK_CUDA(cudaSetDevice(opt.device_start + rank));
+    auto args = myflux::sm80_gemmrs::make_gemmrs_args<FusedGemmRsConfig>(
+        make_fused_params(opt, rank, buffers[rank], fused_output_ptrs));
+    buffers[rank].workspace_bytes =
+        myflux::sm80_gemmrs::gemmrs_workspace_size<FusedGemmRsConfig>(args);
+    if (buffers[rank].workspace_bytes != 0) {
+      MYFLUX_CHECK_CUDA(cudaMalloc(&buffers[rank].workspace, buffers[rank].workspace_bytes));
+      MYFLUX_CHECK_CUDA(cudaMemset(buffers[rank].workspace, 0, buffers[rank].workspace_bytes));
+    }
+  }
 }
 
 void
 free_buffers(const Options &opt, std::vector<RankBuffers> &buffers) {
   for (int rank = 0; rank < opt.world_size; ++rank) {
     MYFLUX_CHECK_CUDA(cudaSetDevice(opt.device_start + rank));
-    cudaFree(buffers[rank].input);
-    cudaFree(buffers[rank].weight);
-    cudaFree(buffers[rank].full_output);
-    cudaFree(buffers[rank].baseline_output);
+    cudaFree(buffers[rank].workspace);
     cudaFree(buffers[rank].fused_output);
-    cudaFree(buffers[rank].fused_workspace);
+    cudaFree(buffers[rank].weight);
+    cudaFree(buffers[rank].input);
   }
 }
 
 void
-run_baseline_once(
-    const Options &opt,
-    RankBuffers &buf,
-    cublasHandle_t cublas,
-    ncclComm_t comm,
-    cudaStream_t stream) {
-  float alpha = 1.0f;
-  float beta = 0.0f;
-
-  // Row-major C[M, N] = A[M, K] * W[N, K]^T is expressed as column-major
-  // C^T[N, M] = W^T[N, K] * A^T[K, M].
-  MYFLUX_CHECK_CUBLAS(cublasGemmEx(
-      cublas,
-      CUBLAS_OP_T,
-      CUBLAS_OP_N,
-      opt.n,
-      opt.m,
-      opt.k,
-      &alpha,
-      buf.weight,
-      CUDA_R_16F,
-      opt.k,
-      buf.input,
-      CUDA_R_16F,
-      opt.k,
-      &beta,
-      buf.full_output,
-      CUDA_R_16F,
-      opt.n,
-      CUBLAS_COMPUTE_32F_FAST_16F,
-      CUBLAS_GEMM_DEFAULT_TENSOR_OP));
-
-  int recv_count = (opt.m / opt.world_size) * opt.n;
-  MYFLUX_CHECK_NCCL(ncclReduceScatter(
-      buf.full_output,
-      buf.baseline_output,
-      recv_count,
-      ncclHalf,
-      ncclSum,
-      comm,
-      stream));
+clear_fused_output_once(const Options &opt, RankBuffers &buf, cudaStream_t stream) {
+  size_t output_bytes = bytes_for_half(static_cast<int64_t>(opt.m) * opt.n);
+  MYFLUX_CHECK_CUDA(cudaMemsetAsync(buf.fused_output, 0, output_bytes, stream));
 }
 
 void
-run_fused_once(
+launch_fused_once(
     const Options &opt,
     int rank,
     RankBuffers &buf,
-    void **fused_output_ptrs,
+    Element **fused_output_ptrs,
     cudaStream_t stream) {
-  if (myflux_sm80_gemmrs_launch == nullptr) {
-    return;
+  auto args = myflux::sm80_gemmrs::make_gemmrs_args<FusedGemmRsConfig>(
+      make_fused_params(opt, rank, buf, fused_output_ptrs));
+  myflux::sm80_gemmrs::run_gemmrs<FusedGemmRsConfig>(args, buf.workspace, stream);
+}
+
+void
+run_fused_iteration(
+    const Options &opt,
+    int rank,
+    RankBuffers &buf,
+    Element **fused_output_ptrs,
+    cudaStream_t stream,
+    ThreadBarrier &barrier) {
+  if (opt.clear_fused_output) {
+    clear_fused_output_once(opt, buf, stream);
+    MYFLUX_CHECK_CUDA(cudaStreamSynchronize(stream));
+    barrier.wait();
   }
+
+  launch_fused_once(opt, rank, buf, fused_output_ptrs, stream);
 
   if (opt.clear_fused_output) {
-    size_t output_bytes = bytes_for_half(static_cast<int64_t>(opt.m / opt.world_size) * opt.n);
-    MYFLUX_CHECK_CUDA(cudaMemsetAsync(buf.fused_output, 0, output_bytes, stream));
-  }
-
-  MyfluxSm80GemmRsLaunchParams params;
-  params.m = opt.m;
-  params.n = opt.n;
-  params.k = opt.k;
-  params.rank = rank;
-  params.world_size = opt.world_size;
-  params.input = buf.input;
-  params.weight = buf.weight;
-  params.output_scatter_ptrs = fused_output_ptrs;
-  params.workspace = buf.fused_workspace;
-  params.workspace_bytes = buf.fused_workspace_bytes;
-
-  int status = myflux_sm80_gemmrs_launch(&params, stream);
-  if (status != 0) {
-    throw std::runtime_error("myflux_sm80_gemmrs_launch failed with status " +
-                             std::to_string(status));
+    MYFLUX_CHECK_CUDA(cudaStreamSynchronize(stream));
+    barrier.wait();
   }
 }
 
 float
-time_loop(
-    int warmup,
-    int iters,
+time_fused_loop(
+    const Options &opt,
+    int rank,
+    RankBuffers &buf,
+    Element **fused_output_ptrs,
     cudaStream_t stream,
-    ThreadBarrier &barrier,
-    const std::function<void()> &fn) {
-  for (int i = 0; i < warmup; ++i) {
-    fn();
+    ThreadBarrier &barrier) {
+  for (int i = 0; i < opt.warmup; ++i) {
+    run_fused_iteration(opt, rank, buf, fused_output_ptrs, stream, barrier);
   }
   MYFLUX_CHECK_CUDA(cudaStreamSynchronize(stream));
-  // 仅用于 benchmark：确保所有 rank 完成 warmup 后再一起开始计时。
   barrier.wait();
 
   CudaEventTimer timer;
   timer.start(stream);
-  for (int i = 0; i < iters; ++i) {
-    fn();
+  for (int i = 0; i < opt.iters; ++i) {
+    run_fused_iteration(opt, rank, buf, fused_output_ptrs, stream, barrier);
   }
   float elapsed_ms = timer.stop(stream);
   MYFLUX_CHECK_CUDA(cudaStreamSynchronize(stream));
-  // 仅用于 benchmark：避免某些 rank 提前进入下一段测试或销毁资源。
   barrier.wait();
-  return elapsed_ms / static_cast<float>(iters);
+  return elapsed_ms / static_cast<float>(opt.iters);
 }
 
 }  // namespace
@@ -411,31 +333,25 @@ main(int argc, char **argv) {
     return 1;
   }
 
-  std::cout << "myflux sm80 gemm+rs case\n";
+  std::cout << "myflux sm80 fused gemm+rs case\n";
   std::cout << "shape: M=" << opt.m << " N=" << opt.n << " localK=" << opt.k
             << " world_size=" << opt.world_size << "\n";
-  std::cout << "iters: warmup=" << opt.warmup << " timed=" << opt.iters << "\n";
+  std::cout << "iters: warmup=" << opt.warmup << " timed=" << opt.iters
+            << " avail_sms=" << opt.avail_sms
+            << " clear_fused_output=" << (opt.clear_fused_output ? "true" : "false") << "\n";
 
   enable_peer_access(opt);
   auto buffers = allocate_buffers(opt);
 
-  std::vector<int> devices(opt.world_size);
-  for (int rank = 0; rank < opt.world_size; ++rank) {
-    devices[rank] = opt.device_start + rank;
-  }
-
-  std::vector<ncclComm_t> comms(opt.world_size);
-  MYFLUX_CHECK_NCCL(ncclCommInitAll(comms.data(), opt.world_size, devices.data()));
-
-  std::vector<void *> fused_output_ptrs(opt.world_size, nullptr);
+  std::vector<Element *> fused_output_ptrs(opt.world_size, nullptr);
   for (int rank = 0; rank < opt.world_size; ++rank) {
     fused_output_ptrs[rank] = buffers[rank].fused_output;
   }
+  allocate_workspaces(opt, buffers, fused_output_ptrs.data());
 
-  std::vector<float> baseline_ms(opt.world_size, 0.0f);
   std::vector<float> fused_ms(opt.world_size, 0.0f);
-  ThreadBarrier barrier(opt.world_size);
   std::vector<std::exception_ptr> errors(opt.world_size);
+  ThreadBarrier barrier(opt.world_size);
 
   auto worker = [&](int rank) {
     try {
@@ -443,28 +359,9 @@ main(int argc, char **argv) {
 
       cudaStream_t stream = nullptr;
       MYFLUX_CHECK_CUDA(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
-
-      cublasHandle_t cublas = nullptr;
-      MYFLUX_CHECK_CUBLAS(cublasCreate(&cublas));
-      MYFLUX_CHECK_CUBLAS(cublasSetStream(cublas, stream));
-      MYFLUX_CHECK_CUBLAS(cublasSetMathMode(cublas, CUBLAS_TENSOR_OP_MATH));
-
-      if (opt.run_baseline) {
-        baseline_ms[rank] = time_loop(opt.warmup, opt.iters, stream, barrier, [&] {
-          run_baseline_once(opt, buffers[rank], cublas, comms[rank], stream);
-        });
-      }
-
-      if (opt.run_fused && myflux_sm80_gemmrs_launch != nullptr) {
-        fused_ms[rank] = time_loop(opt.warmup, opt.iters, stream, barrier, [&] {
-          run_fused_once(opt, rank, buffers[rank], fused_output_ptrs.data(), stream);
-        });
-      } else if (opt.run_fused && rank == 0) {
-        std::cout << "fused launcher symbol is not linked; skipping fused timing\n";
-      }
-
+      fused_ms[rank] = time_fused_loop(
+          opt, rank, buffers[rank], fused_output_ptrs.data(), stream, barrier);
       MYFLUX_CHECK_CUDA(cudaStreamSynchronize(stream));
-      MYFLUX_CHECK_CUBLAS(cublasDestroy(cublas));
       MYFLUX_CHECK_CUDA(cudaStreamDestroy(stream));
     } catch (...) {
       errors[rank] = std::current_exception();
@@ -486,16 +383,7 @@ main(int argc, char **argv) {
     }
   }
 
-  if (opt.run_baseline) {
-    myflux::perf::print_rank_times("baseline_gemm_then_nccl_rs", baseline_ms);
-  }
-  if (opt.run_fused && myflux_sm80_gemmrs_launch != nullptr) {
-    myflux::perf::print_rank_times("fused_sm80_gemmrs", fused_ms);
-  }
-
-  for (int rank = 0; rank < opt.world_size; ++rank) {
-    MYFLUX_CHECK_NCCL(ncclCommDestroy(comms[rank]));
-  }
+  myflux::perf::print_rank_times("fused_sm80_gemmrs", fused_ms);
   free_buffers(opt, buffers);
   return 0;
 }
