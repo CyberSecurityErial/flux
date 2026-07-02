@@ -62,6 +62,8 @@ using DefaultGemmRsConfig = GemmRs128x128x32;
 template <class GemmRsConfig>
 struct GemmRsKernelTypes;
 
+// 后续实现时在这里做 host 侧薄检查：rank/world_size、scatter ptr、M/world_size、
+// tiled_m/world_size 以及当前是否要求 M 对齐 ThreadblockShape::kM。
 template <class GemmRsConfig>
 typename GemmRsKernelTypes<GemmRsConfig>::Arguments
 make_gemmrs_args(const GemmRsLaunchParams &params);
