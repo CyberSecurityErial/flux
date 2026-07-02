@@ -89,22 +89,161 @@ struct GemmRsKernelTypes {
   using Arguments = typename Gemm::Arguments;
 };
 
-// 后续实现时在这里做 host 侧薄检查：rank/world_size、scatter ptr、M/world_size、
-// tiled_m/world_size 以及当前是否要求 M 对齐 ThreadblockShape::kM。
-template <class GemmRsConfig>
-typename GemmRsKernelTypes<GemmRsConfig>::Arguments
-make_gemmrs_args(const GemmRsLaunchParams &params);
+inline void
+gemmrs_fail(const char *message) {
+  std::fprintf(stderr, "myflux GEMMRS argument error: %s\n", message);
+  std::abort();
+}
+
+inline void
+warn_gemmrs_rank_env(const GemmRsLaunchParams &params) {
+  if (params.world_size <= 1) {
+    return;
+  }
+
+  const char *local_rank_env = std::getenv("LOCAL_RANK");
+  const char *local_world_size_env = std::getenv("LOCAL_WORLD_SIZE");
+  if (local_rank_env == nullptr || local_world_size_env == nullptr) {
+    static bool warned_missing_env = false;
+    if (!warned_missing_env) {
+      warned_missing_env = true;
+      std::fprintf(
+          stderr,
+          "myflux GEMMRS notice: LOCAL_RANK/LOCAL_WORLD_SIZE are not set; "
+          "rank-offset swizzle will use defaults and may lose Flux GEMMRS tile-order alignment.\n");
+    }
+    return;
+  }
+
+  int local_rank = std::atoi(local_rank_env);
+  int local_world_size = std::atoi(local_world_size_env);
+  if (local_rank != params.rank || local_world_size != params.world_size) {
+    static bool warned_mismatch_env = false;
+    if (!warned_mismatch_env) {
+      warned_mismatch_env = true;
+      std::fprintf(
+          stderr,
+          "myflux GEMMRS warning: params rank/world_size=(%d,%d) but "
+          "LOCAL_RANK/LOCAL_WORLD_SIZE=(%d,%d); GEMMRS output addressing uses params, "
+          "but rank-offset swizzle may be misaligned.\n",
+          params.rank,
+          params.world_size,
+          local_rank,
+          local_world_size);
+    }
+  }
+}
 
 template <class GemmRsConfig>
-size_t
-gemmrs_workspace_size(const typename GemmRsKernelTypes<GemmRsConfig>::Arguments &args);
+inline void
+validate_gemmrs_launch_params(const GemmRsLaunchParams &params) {
+  constexpr int kM = GemmRsConfig::ThreadblockShape::kM;
+  int m = params.problem.m;
+  int n = params.problem.n;
+  int k = params.problem.k;
+  int world_size = params.world_size;
+
+  if (m <= 0 || n <= 0 || k <= 0) {
+    gemmrs_fail("problem m/n/k must be positive");
+  }
+  if (world_size <= 0 || world_size > kMaxWorldSize) {
+    gemmrs_fail("world_size must be in (0, kMaxWorldSize]");
+  }
+  if (params.rank < 0 || params.rank >= world_size) {
+    gemmrs_fail("rank must be in [0, world_size)");
+  }
+  warn_gemmrs_rank_env(params);
+  if (params.ptr_a == nullptr || params.ptr_b == nullptr) {
+    gemmrs_fail("ptr_a and ptr_b must be non-null");
+  }
+  if (params.output_scatter_ptrs == nullptr) {
+    gemmrs_fail("output_scatter_ptrs must be non-null");
+  }
+  for (int i = 0; i < world_size; ++i) {
+    if (params.output_scatter_ptrs[i] == nullptr) {
+      gemmrs_fail("output_scatter_ptrs entries must be non-null");
+    }
+  }
+  if (m % world_size != 0) {
+    gemmrs_fail("problem m must be divisible by world_size");
+  }
+  int tiled_m = (m + kM - 1) / kM;
+  if (tiled_m < world_size) {
+    gemmrs_fail("tiled_m must be at least world_size");
+  }
+  if (tiled_m % world_size != 0) {
+    gemmrs_fail("tiled_m must be divisible by world_size");
+  }
+  if (m % kM != 0) {
+    gemmrs_fail("temporary bring-up requires problem m aligned to ThreadblockShape::kM");
+  }
+}
 
 template <class GemmRsConfig>
-void
+auto
+make_gemmrs_epilogue_args(const GemmRsLaunchParams &params) {
+  using KernelTypes = GemmRsKernelTypes<GemmRsConfig>;
+  using EpilogueArguments = typename KernelTypes::Epilogue::Arguments;
+  using ComputeArguments = typename KernelTypes::ComputeD::Arguments;
+  using StoreArguments = typename KernelTypes::StoreD::Arguments;
+
+  int m = params.problem.m;
+  int n = params.problem.n;
+  auto stride_d = cute::make_stride(int64_t(n), cute::_1{}, int64_t(m) * n);
+  ComputeArguments compute_args{{{params.alpha}}, {}, {}};
+  StoreArguments store_args{params.output_scatter_ptrs, stride_d, params.rank, params.world_size};
+  return EpilogueArguments{compute_args, store_args};
+}
+
+template <class GemmRsConfig>
+inline typename GemmRsKernelTypes<GemmRsConfig>::Arguments
+make_gemmrs_args(const GemmRsLaunchParams &params) {
+  validate_gemmrs_launch_params<GemmRsConfig>(params);
+
+  int m = params.problem.m;
+  int n = params.problem.n;
+  int k = params.problem.k;
+  auto epilogue_args = make_gemmrs_epilogue_args<GemmRsConfig>(params);
+  int stride_b = cutlass_utils::stride_b_rcr(n, k);
+  int stride_d = cutlass_utils::stride_c_rowmajor(m, n);
+
+  return typename GemmRsKernelTypes<GemmRsConfig>::Arguments(
+      cutlass::gemm::GemmUniversalMode::kGemm,
+      {m, n, k},
+      1,
+      epilogue_args,
+      params.ptr_a,
+      params.ptr_b,
+      nullptr,
+      nullptr,
+      int64_t(m) * k,
+      int64_t(n) * k,
+      int64_t(m) * n,
+      int64_t(m) * n,
+      k,
+      stride_b,
+      n,
+      stride_d,
+      params.avail_sms);
+}
+
+template <class GemmRsConfig>
+inline size_t
+gemmrs_workspace_size(const typename GemmRsKernelTypes<GemmRsConfig>::Arguments &args) {
+  return GemmRsKernelTypes<GemmRsConfig>::Device::get_workspace_size(args);
+}
+
+template <class GemmRsConfig>
+inline void
 run_gemmrs(
     const typename GemmRsKernelTypes<GemmRsConfig>::Arguments &args,
     void *workspace,
-    cudaStream_t stream);
+    cudaStream_t stream) {
+  typename GemmRsKernelTypes<GemmRsConfig>::Device gemm;
+  MYFLUX_CHECK_CUTLASS(GemmRsKernelTypes<GemmRsConfig>::Device::can_implement(args));
+  MYFLUX_CHECK_CUTLASS(gemm.initialize(args, workspace, stream));
+  MYFLUX_CHECK_CUTLASS(gemm.run(stream));
+}
 
 using PlainComputeD = cutlass_utils::AlphaAccumEVT<>;
 

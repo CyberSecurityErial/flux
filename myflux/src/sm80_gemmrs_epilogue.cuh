@@ -43,7 +43,8 @@ namespace myflux::sm80_gemmrs {
 // VisitorAuxStoreScatter 的 NVLink 分支，不包含 PCIe barrier queue 胶水。
 // Buffer contract 对齐 Flux wrapper：
 // - FuseReduction=false: scatter_ptr_aux[i] 指向完整 [M, N] scratch buffer。
-// - FuseReduction=true: scatter_ptr_aux[i] 指向已清零的最终 [M/world_size, N] buffer。
+// - FuseReduction=true: Flux 仍分配完整 [M, N] output buffer，但 visitor 只用 global_red
+//   写前 [M/world_size, N] slice；被写 slice 在 launch 前必须清零。
 // launcher 侧需要检查 rank/world_size/M/tile 合法性，visitor 不做 host 参数兜底。
 template <class StrideMNL = cutlass_utils::StrideMNL>
 struct GemmRsScatterStoreArguments {
