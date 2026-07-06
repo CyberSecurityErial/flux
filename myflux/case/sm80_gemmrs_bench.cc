@@ -1,21 +1,21 @@
 // 分离式 baseline：plain CUTLASS GEMM 写完整输出，再调用 NCCL ReduceScatter。
-// 这个 case 不接 fused GEMMRS kernel。
+// 这个 case 使用 MPI 一进程一 GPU，不接 fused GEMMRS kernel。
 #include "sm80_gemmrs.cuh"
 
+#include "mpi_cuda_ipc_utils.h"
+
 #include <nccl.h>
+#include <mpi.h>
 
 #include <algorithm>
-#include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <iomanip>
 #include <iostream>
-#include <mutex>
 #include <numeric>
 #include <stdexcept>
 #include <string>
-#include <thread>
 #include <vector>
 
 namespace {
@@ -27,35 +27,11 @@ check_nccl(ncclResult_t status, const char *expr, const char *file, int line) {
   if (status != ncclSuccess) {
     std::cerr << "NCCL error at " << file << ":" << line << ": " << expr
               << " failed: " << ncclGetErrorString(status) << "\n";
-    std::abort();
+    MPI_Abort(MPI_COMM_WORLD, 1);
   }
 }
 
 #define MYFLUX_BENCH_CHECK_NCCL(expr) check_nccl((expr), #expr, __FILE__, __LINE__)
-
-class ThreadBarrier {
- public:
-  explicit ThreadBarrier(int count) : count_(count) {}
-
-  void wait() {
-    std::unique_lock<std::mutex> lock(mutex_);
-    int generation = generation_;
-    if (++arrived_ == count_) {
-      arrived_ = 0;
-      ++generation_;
-      cv_.notify_all();
-      return;
-    }
-    cv_.wait(lock, [&] { return generation != generation_; });
-  }
-
- private:
-  int count_ = 0;
-  int arrived_ = 0;
-  int generation_ = 0;
-  std::mutex mutex_;
-  std::condition_variable cv_;
-};
 
 struct Options {
   int m = 4096;
@@ -88,11 +64,11 @@ parse_int_arg(int argc, char **argv, int &i, const std::string &arg, const char 
 
 void
 print_usage(const char *program) {
-  std::cout << "Usage: " << program << " [options]\n"
+  std::cout << "Usage: mpirun -np <world_size> " << program << " [options]\n"
             << "  --m <int>             GEMM M, must be divisible by world size\n"
             << "  --n <int>             GEMM N\n"
             << "  --k <int>             local GEMM K per rank\n"
-            << "  --world-size <int>    local GPU count, default 8\n"
+            << "  --world-size <int>    MPI world size, default 8\n"
             << "  --device-start <int>  first CUDA device ordinal, default 0\n"
             << "  --warmup <int>        warmup iterations, default 10\n"
             << "  --iters <int>         timed iterations, default 50\n"
@@ -159,10 +135,9 @@ malloc_bytes(void **ptr, size_t bytes) {
   MYFLUX_CHECK_CUDA(cudaMalloc(ptr, bytes));
 }
 
-void
-allocate_rank_buffers(const Options &opt, int rank, RankBuffers &buf, cudaStream_t stream) {
-  MYFLUX_CHECK_CUDA(cudaSetDevice(opt.device_start + rank));
-
+RankBuffers
+allocate_rank_buffers(const Options &opt, cudaStream_t stream) {
+  RankBuffers buf;
   int m_per_rank = opt.m / opt.world_size;
   size_t input_bytes = bytes_for_half(static_cast<int64_t>(opt.m) * opt.k);
   size_t weight_bytes = bytes_for_half(static_cast<int64_t>(opt.n) * opt.k);
@@ -187,11 +162,11 @@ allocate_rank_buffers(const Options &opt, int rank, RankBuffers &buf, cudaStream
     MYFLUX_CHECK_CUDA(cudaMemsetAsync(buf.workspace, 0, buf.workspace_bytes, stream));
   }
   MYFLUX_CHECK_CUDA(cudaStreamSynchronize(stream));
+  return buf;
 }
 
 void
-free_rank_buffers(const Options &opt, int rank, RankBuffers &buf) {
-  MYFLUX_CHECK_CUDA(cudaSetDevice(opt.device_start + rank));
+free_rank_buffers(RankBuffers &buf) {
   cudaFree(buf.workspace);
   cudaFree(buf.rs_output);
   cudaFree(buf.full_output);
@@ -200,38 +175,23 @@ free_rank_buffers(const Options &opt, int rank, RankBuffers &buf) {
 }
 
 void
-run_gemm_then_rs_once(
-    const Options &opt,
-    RankBuffers &buf,
-    ncclComm_t comm,
-    cudaStream_t stream) {
+run_gemm_then_rs_once(const Options &opt, RankBuffers &buf, ncclComm_t comm, cudaStream_t stream) {
   auto args = myflux::sm80_gemmrs::make_plain_gemm128_args(
       opt.m, opt.n, opt.k, buf.input, buf.weight, buf.full_output, opt.avail_sms);
   myflux::sm80_gemmrs::run_plain_gemm128(args, buf.workspace, stream);
 
   int recv_count = (opt.m / opt.world_size) * opt.n;
   MYFLUX_BENCH_CHECK_NCCL(ncclReduceScatter(
-      buf.full_output,
-      buf.rs_output,
-      recv_count,
-      ncclHalf,
-      ncclSum,
-      comm,
-      stream));
+      buf.full_output, buf.rs_output, recv_count, ncclHalf, ncclSum, comm, stream));
 }
 
 float
-time_loop(
-    const Options &opt,
-    RankBuffers &buf,
-    ncclComm_t comm,
-    cudaStream_t stream,
-    ThreadBarrier &barrier) {
+time_loop(const Options &opt, RankBuffers &buf, ncclComm_t comm, cudaStream_t stream, MPI_Comm mpi_comm) {
   for (int i = 0; i < opt.warmup; ++i) {
     run_gemm_then_rs_once(opt, buf, comm, stream);
   }
   MYFLUX_CHECK_CUDA(cudaStreamSynchronize(stream));
-  barrier.wait();
+  MYFLUX_CASE_CHECK_MPI(MPI_Barrier(mpi_comm));
 
   cudaEvent_t start = nullptr;
   cudaEvent_t stop = nullptr;
@@ -249,7 +209,7 @@ time_loop(
   MYFLUX_CHECK_CUDA(cudaEventDestroy(start));
   MYFLUX_CHECK_CUDA(cudaEventDestroy(stop));
   MYFLUX_CHECK_CUDA(cudaStreamSynchronize(stream));
-  barrier.wait();
+  MYFLUX_CASE_CHECK_MPI(MPI_Barrier(mpi_comm));
   return elapsed_ms / static_cast<float>(opt.iters);
 }
 
@@ -276,57 +236,66 @@ print_summary(const Options &opt, const std::vector<float> &rank_ms) {
 
 int
 main(int argc, char **argv) {
-  Options opt = parse_options(argc, argv);
+  MYFLUX_CASE_CHECK_MPI(MPI_Init(&argc, &argv));
+  int rank = 0;
+  int nranks = 1;
+  MYFLUX_CASE_CHECK_MPI(MPI_Comm_rank(MPI_COMM_WORLD, &rank));
+  MYFLUX_CASE_CHECK_MPI(MPI_Comm_size(MPI_COMM_WORLD, &nranks));
 
-  int device_count = 0;
-  MYFLUX_CHECK_CUDA(cudaGetDeviceCount(&device_count));
-  if (opt.device_start + opt.world_size > device_count) {
-    std::cerr << "requested " << opt.world_size << " devices from " << opt.device_start
-              << ", visible device count is " << device_count << "\n";
-    return 1;
+  try {
+    Options opt = parse_options(argc, argv);
+    if (opt.world_size != nranks) {
+      throw std::invalid_argument("--world-size must match MPI_COMM_WORLD size");
+    }
+
+    int local_rank = myflux::case_utils::mpi_local_rank(rank);
+    int local_world_size = myflux::case_utils::mpi_local_world_size(nranks);
+    myflux::case_utils::set_flux_rank_env(local_rank, local_world_size);
+
+    int device_count = 0;
+    MYFLUX_CHECK_CUDA(cudaGetDeviceCount(&device_count));
+    if (opt.device_start + local_rank >= device_count) {
+      throw std::runtime_error("not enough visible CUDA devices for local rank");
+    }
+    MYFLUX_CHECK_CUDA(cudaSetDevice(opt.device_start + local_rank));
+
+    if (rank == 0) {
+      std::cout << "myflux sm80 plain GEMM + NCCL ReduceScatter MPI bench\n";
+      std::cout << "M=" << opt.m << " N=" << opt.n << " localK=" << opt.k
+                << " world_size=" << opt.world_size << " warmup=" << opt.warmup
+                << " iters=" << opt.iters << "\n";
+    }
+
+    cudaStream_t stream = nullptr;
+    MYFLUX_CHECK_CUDA(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+
+    ncclUniqueId nccl_id;
+    if (rank == 0) {
+      MYFLUX_BENCH_CHECK_NCCL(ncclGetUniqueId(&nccl_id));
+    }
+    MYFLUX_CASE_CHECK_MPI(MPI_Bcast(&nccl_id, sizeof(nccl_id), MPI_BYTE, 0, MPI_COMM_WORLD));
+
+    ncclComm_t comm = nullptr;
+    MYFLUX_BENCH_CHECK_NCCL(ncclCommInitRank(&comm, nranks, nccl_id, rank));
+
+    RankBuffers buf = allocate_rank_buffers(opt, stream);
+    MYFLUX_CASE_CHECK_MPI(MPI_Barrier(MPI_COMM_WORLD));
+    float rank_ms = time_loop(opt, buf, comm, stream, MPI_COMM_WORLD);
+
+    auto all_ms = myflux::case_utils::gather_rank_ms(rank_ms, rank, nranks, MPI_COMM_WORLD);
+    if (rank == 0) {
+      print_summary(opt, all_ms);
+    }
+
+    MYFLUX_CASE_CHECK_MPI(MPI_Barrier(MPI_COMM_WORLD));
+    free_rank_buffers(buf);
+    MYFLUX_BENCH_CHECK_NCCL(ncclCommDestroy(comm));
+    MYFLUX_CHECK_CUDA(cudaStreamDestroy(stream));
+  } catch (const std::exception &ex) {
+    std::cerr << "rank " << rank << " failed: " << ex.what() << "\n";
+    MPI_Abort(MPI_COMM_WORLD, 1);
   }
 
-  std::cout << "myflux sm80 plain GEMM + NCCL ReduceScatter bench\n";
-  std::cout << "M=" << opt.m << " N=" << opt.n << " localK=" << opt.k
-            << " world_size=" << opt.world_size << " warmup=" << opt.warmup
-            << " iters=" << opt.iters << "\n";
-
-  std::vector<int> devices(opt.world_size);
-  for (int rank = 0; rank < opt.world_size; ++rank) {
-    devices[rank] = opt.device_start + rank;
-  }
-
-  std::vector<ncclComm_t> comms(opt.world_size);
-  MYFLUX_BENCH_CHECK_NCCL(ncclCommInitAll(comms.data(), opt.world_size, devices.data()));
-
-  ThreadBarrier barrier(opt.world_size);
-  std::vector<float> rank_ms(opt.world_size, 0.0f);
-  std::vector<std::thread> workers;
-  workers.reserve(opt.world_size);
-
-  for (int rank = 0; rank < opt.world_size; ++rank) {
-    workers.emplace_back([&, rank] {
-      MYFLUX_CHECK_CUDA(cudaSetDevice(opt.device_start + rank));
-      cudaStream_t stream = nullptr;
-      MYFLUX_CHECK_CUDA(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
-
-      RankBuffers buf;
-      allocate_rank_buffers(opt, rank, buf, stream);
-      rank_ms[rank] = time_loop(opt, buf, comms[rank], stream, barrier);
-      free_rank_buffers(opt, rank, buf);
-
-      MYFLUX_CHECK_CUDA(cudaStreamDestroy(stream));
-    });
-  }
-
-  for (auto &worker : workers) {
-    worker.join();
-  }
-
-  print_summary(opt, rank_ms);
-
-  for (int rank = 0; rank < opt.world_size; ++rank) {
-    MYFLUX_BENCH_CHECK_NCCL(ncclCommDestroy(comms[rank]));
-  }
+  MYFLUX_CASE_CHECK_MPI(MPI_Finalize());
   return 0;
 }

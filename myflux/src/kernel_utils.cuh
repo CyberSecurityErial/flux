@@ -184,4 +184,123 @@ stride_c_rowmajor(int m, int n) {
 }
 
 }  // namespace cutlass_utils
+
+
+namespace peer_barrier {
+
+struct Args {
+  int *sync_buffers[kMaxWorldSize];
+  int rank = 0;
+  int world_size = 1;
+};
+
+namespace detail {
+
+static __device__ int
+ld_acquire_sys(volatile int *ptr) {
+  int state = 0;
+  asm volatile("ld.global.acquire.sys.b32 %0, [%1];\n" : "=r"(state) : "l"(ptr));
+  return state;
+}
+
+static __device__ void
+store_release_sys(volatile int *ptr, int value) {
+  asm volatile("st.release.sys.b32 [%0], %1;\n" : : "l"(ptr), "r"(value));
+}
+
+static __global__ void
+all_to_all_atomic_kernel(Args args) {
+  int world_size = args.world_size;
+  int cur_rank = args.rank;
+  if (threadIdx.x < world_size) {
+    __threadfence_system();
+    int *sync_buffer_dst = args.sync_buffers[threadIdx.x] + cur_rank;
+#pragma unroll 1
+    while (atomicCAS_system(sync_buffer_dst, 0, 1) != 0) {
+    }
+    __threadfence_system();
+    int *wait_ptr = args.sync_buffers[cur_rank] + threadIdx.x;
+#pragma unroll 1
+    while (atomicCAS_system(wait_ptr, 1, 0) != 1) {
+    }
+    __threadfence_system();
+  }
+}
+
+// Ring fallback mirrors Flux's CUDA IPC ring barrier. It avoids system atomic CAS,
+// but uses a serialized token and is more fragile for continuous barriers.
+static __global__ void
+ring_kernel(Args args) {
+  int world_size = args.world_size;
+  int cur_rank = args.rank;
+  int next_peer = (cur_rank + 1) % world_size;
+  volatile int *ptr_next_peer = args.sync_buffers[next_peer];
+  volatile int *ptr_cur_rank = args.sync_buffers[cur_rank];
+  if (threadIdx.x != 0) {
+    return;
+  }
+  if (cur_rank == 0) {
+    store_release_sys(ptr_next_peer, 1);
+  } else {
+#pragma unroll 1
+    while (ld_acquire_sys(ptr_cur_rank) != 1) {
+    }
+    store_release_sys(ptr_next_peer, 1);
+  }
+  __threadfence_system();
+  if (cur_rank != world_size - 1) {
+#pragma unroll 1
+    while (ld_acquire_sys(ptr_next_peer) != 0) {
+    }
+  }
+  ptr_cur_rank[0] = 0;
+}
+
+}  // namespace detail
+
+inline void
+launch_all_to_all_atomic(int **sync_buffers, int rank, int world_size, cudaStream_t stream) {
+  if (world_size <= 1) {
+    return;
+  }
+  if (world_size > kMaxWorldSize) {
+    std::fprintf(stderr, "myflux peer barrier world_size exceeds kMaxWorldSize\n");
+    std::abort();
+  }
+  Args args;
+  args.rank = rank;
+  args.world_size = world_size;
+  for (int i = 0; i < world_size; ++i) {
+    args.sync_buffers[i] = sync_buffers[i];
+  }
+  detail::all_to_all_atomic_kernel<<<1, kMaxWorldSize, 0, stream>>>(args);
+  MYFLUX_CHECK_CUDA(cudaGetLastError());
+}
+
+inline void
+launch_ring(int **sync_buffers, int rank, int world_size, cudaStream_t stream) {
+  if (world_size <= 1) {
+    return;
+  }
+  if (world_size > kMaxWorldSize) {
+    std::fprintf(stderr, "myflux peer barrier world_size exceeds kMaxWorldSize\n");
+    std::abort();
+  }
+  Args args;
+  args.rank = rank;
+  args.world_size = world_size;
+  for (int i = 0; i < world_size; ++i) {
+    args.sync_buffers[i] = sync_buffers[i];
+  }
+  detail::ring_kernel<<<1, kMaxWorldSize, 0, stream>>>(args);
+  MYFLUX_CHECK_CUDA(cudaGetLastError());
+}
+
+inline size_t
+workspace_bytes(int world_size) {
+  return static_cast<size_t>(world_size) * sizeof(int);
+}
+
+}  // namespace peer_barrier
+
 }  // namespace myflux
